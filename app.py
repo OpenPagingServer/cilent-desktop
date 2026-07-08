@@ -1559,7 +1559,7 @@ class ServerAddressDialog:
                 def confirm_http(origin):
                     return native_message_box(
                         self.app.product_name,
-                        f"{origin} does not use a secure connection (HTTP). Your pages will not be encrypted. Do you want to continue?",
+                        f"{origin} does not support SSL. Do you want to continue?",
                         MB_YESNO | MB_ICONWARNING,
                     ) == IDYES
 
@@ -1587,7 +1587,7 @@ class ServerAddressDialog:
             threading.Thread(target=worker, daemon=True).start()
 
         login_button = tk.Button(
-            root, text="LOGIN", command=do_login, font=button_font,
+            root, text="CONNECT", command=do_login, font=button_font,
             bg=accent, fg="#FFFFFF", activebackground="#1565C0", activeforeground="#FFFFFF",
             relief="flat", cursor="hand2", padx=60, pady=8, borderwidth=0,
         )
@@ -2065,7 +2065,7 @@ class ClientApp:
         self.config[key] = True
         save_config(self.config)
         self.notify(
-            f'Connected to "{self.product_name}"',
+            f'Connected to {self.product_name}',
             "You are now ready to receive pages and emergency notifications from your organization.",
         )
 
