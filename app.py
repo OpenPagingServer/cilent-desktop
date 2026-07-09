@@ -7,6 +7,7 @@ import os
 import platform
 import queue
 import secrets
+import shutil
 import socket
 import ssl
 import struct
@@ -19,6 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import wave
+import webbrowser
 from collections import deque
 from ctypes import wintypes
 from datetime import datetime, timedelta
@@ -67,10 +69,16 @@ from tkinter import font as tkfont
 APP_FALLBACK_NAME = "Open Paging Server"
 DESKTOP_CLIENT_HEADER = "x-ops-desktop-client"
 CLIENT_OS_HEADER = "X-OPS-Client-OS"
+EXTERNAL_BROWSER_SCHEMES = {"http", "https", "mailto", "tel"}
 CONFIG_DIR = Path(os.getenv("APPDATA") or Path.home()) / "OpenPagingServerClient"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "OpenPagingServerClient"
+
+AUTOSTART_FLAG = "--autostart"
+AUTOSTART_ARG_VALUES = {"--autostart", "/autostart", "--minimized", "/minimized"}
+SINGLE_INSTANCE_MUTEX = "OpenPagingServerClient_SingleInstance_Mutex"
+SINGLE_INSTANCE_EVENT = "OpenPagingServerClient_ShowWindow_Event"
 
 COLOR_CONNECTED = "#2E7D32"
 COLOR_DISCONNECTED = "#C62828"
@@ -86,9 +94,25 @@ IDYES = 6
 
 WM_MOVING = 0x0216
 WM_SYSCOMMAND = 0x0112
+WM_DPICHANGED = 0x02E0
 _SC_MOVE = 0xF010
 _GWLP_WNDPROC = -4
-_popup_proc_refs: list = []  # keep WndProc callbacks alive (prevent GC)
+_GWLP_HWNDPARENT = -8
+_SWP_NOZORDER = 0x0004
+_SWP_NOACTIVATE = 0x0010
+
+FLASHW_STOP = 0x00000000
+FLASHW_CAPTION = 0x00000001
+FLASHW_TRAY = 0x00000002
+FLASHW_ALL = FLASHW_CAPTION | FLASHW_TRAY
+FLASHW_TIMERNOFG = 0x0000000C
+
+# Per-window DPI awareness context handle; -1 == DPI_AWARENESS_CONTEXT_UNAWARE.
+DPI_AWARENESS_CONTEXT_UNAWARE = -1
+_popup_proc_refs: list = []
+_dpi_proc_refs: list = []
+_dpi_hooked_hwnds: set = set()
+_SINGLE_INSTANCE_HANDLES: list = []
 
 INSECURE_HOSTS = set()
 
@@ -289,7 +313,6 @@ def native_message_box(title, text, flags, owner=0):
 
 
 def _hook_no_move(hwnd):
-    """Subclass the WndProc of hwnd so the window cannot be moved at all."""
     if not hwnd or os.name != "nt":
         return
     try:
@@ -314,7 +337,6 @@ def _hook_no_move(hwnd):
             if msg == WM_SYSCOMMAND and (wp & 0xFFF0) == _SC_MOVE:
                 return 0
             if msg == WM_MOVING:
-                # Pin window: write current rect back into the RECT pointed to by lp
                 try:
                     cur = wintypes.RECT()
                     user32.GetWindowRect(h, ctypes.byref(cur))
@@ -326,6 +348,63 @@ def _hook_no_move(hwnd):
 
         user32.SetWindowLongPtrW(hwnd, _GWLP_WNDPROC, ctypes.cast(_no_move_proc, ctypes.c_void_p))
         _popup_proc_refs.append((_no_move_proc, old_wndproc))
+    except Exception:
+        pass
+
+
+def _hook_dpi_changed(hwnd):
+    """Honor WM_DPICHANGED on the main window so a Per-Monitor-DPI-aware app
+    resizes to the OS-suggested rectangle when it moves between monitors with
+    different scaling. pywebview's bundled .NET Framework WinForms host ignores
+    this message, which otherwise makes the window progressively shrink and
+    transition poorly (blurry) between mixed-DPI displays."""
+    if not hwnd or os.name != "nt":
+        return
+    if hwnd in _dpi_hooked_hwnds:
+        return
+    try:
+        user32 = ctypes.windll.user32
+        user32.GetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+        user32.CallWindowProcW.restype = ctypes.c_ssize_t
+        user32.CallWindowProcW.argtypes = [
+            ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        ]
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, wintypes.UINT,
+        ]
+
+        _WndProc = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t,
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        )
+        old_ptr = user32.GetWindowLongPtrW(hwnd, _GWLP_WNDPROC)
+        if not old_ptr:
+            return
+
+        @_WndProc
+        def _dpi_proc(h, msg, wp, lp):
+            if msg == WM_DPICHANGED and lp:
+                try:
+                    suggested = ctypes.cast(lp, ctypes.POINTER(wintypes.RECT)).contents
+                    user32.SetWindowPos(
+                        h, None,
+                        suggested.left, suggested.top,
+                        suggested.right - suggested.left,
+                        suggested.bottom - suggested.top,
+                        _SWP_NOZORDER | _SWP_NOACTIVATE,
+                    )
+                    return 0
+                except Exception:
+                    pass
+            return user32.CallWindowProcW(old_ptr, h, msg, wp, lp)
+
+        user32.SetWindowLongPtrW(hwnd, _GWLP_WNDPROC, ctypes.cast(_dpi_proc, ctypes.c_void_p))
+        _dpi_proc_refs.append((_dpi_proc, old_ptr))
+        _dpi_hooked_hwnds.add(hwnd)
     except Exception:
         pass
 
@@ -409,10 +488,10 @@ def all_monitor_bounds():
 def virtual_screen_bounds():
     try:
         user32 = ctypes.windll.user32
-        x = int(user32.GetSystemMetrics(76))   # SM_XVIRTUALSCREEN
-        y = int(user32.GetSystemMetrics(77))   # SM_YVIRTUALSCREEN
-        w = int(user32.GetSystemMetrics(78))   # SM_CXVIRTUALSCREEN
-        h = int(user32.GetSystemMetrics(79))   # SM_CYVIRTUALSCREEN
+        x = int(user32.GetSystemMetrics(76))
+        y = int(user32.GetSystemMetrics(77))
+        w = int(user32.GetSystemMetrics(78))
+        h = int(user32.GetSystemMetrics(79))
         if w > 0 and h > 0:
             return {"x": x, "y": y, "width": w, "height": h}
     except Exception:
@@ -429,10 +508,64 @@ def virtual_screen_bounds():
 
 def startup_command():
     if getattr(sys, "frozen", False):
-        return f'"{sys.executable}"'
+        return f'"{sys.executable}" {AUTOSTART_FLAG}'
     pythonw = Path(sys.executable).with_name("pythonw.exe")
     interpreter = str(pythonw if pythonw.is_file() else sys.executable)
-    return f'"{interpreter}" "{Path(__file__).resolve()}"'
+    return f'"{interpreter}" "{Path(__file__).resolve()}" {AUTOSTART_FLAG}'
+
+
+def launched_at_startup():
+    return any(str(arg).strip().lower() in AUTOSTART_ARG_VALUES for arg in sys.argv[1:])
+
+
+def _acquire_single_instance():
+    """Return (is_primary, mutex_handle). Non-Windows always acts as primary."""
+    if not sys.platform.startswith("win"):
+        return True, None
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        handle = kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX)
+        already_running = ctypes.get_last_error() == 183 or kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+        return (not already_running), handle
+    except Exception:
+        return True, None
+
+
+def create_show_event():
+    """Create the named auto-reset event the primary instance waits on."""
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateEventW.restype = wintypes.HANDLE
+        kernel32.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+        # CreateEventW(security, manual_reset=False, initial_state=False, name)
+        return kernel32.CreateEventW(None, False, False, SINGLE_INSTANCE_EVENT)
+    except Exception:
+        return None
+
+
+def signal_existing_instance():
+    """Ask the already-running instance to bring its window to the front."""
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenEventW.restype = wintypes.HANDLE
+        kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        EVENT_MODIFY_STATE = 0x0002
+        handle = kernel32.OpenEventW(EVENT_MODIFY_STATE, False, SINGLE_INSTANCE_EVENT)
+        if handle:
+            kernel32.SetEvent(handle)
+            kernel32.CloseHandle(handle)
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def startup_enabled():
@@ -616,7 +749,7 @@ class AudioPlayer:
         self.live_gap_repeats = 0
         self.live_stream_closed = False
         self.live_stop_event = threading.Event()
-        self._live_frame_event = threading.Event()  # signals generator when frame arrives
+        self._live_frame_event = threading.Event()
         self.recordings = {}
         self.on_state_change = on_state_change
 
@@ -631,11 +764,8 @@ class AudioPlayer:
         return b"\x00" * max(1, int(frames)) * 2
 
     def _live_generator(self):
-        # Accumulate raw PCM bytes
         buffer = bytearray()
         live_buffering = True
-        
-        # First yield to support priming
         num_frames = (yield b"") or 160
         while not self.live_stop_event.is_set():
             bytes_needed = (num_frames or 160) * 2
@@ -646,7 +776,6 @@ class AudioPlayer:
             with self.lock:
                 active = bool(self.mode == "live" and not self.live_paused)
                 if active:
-                    # Pull all available frames from self.live_queue
                     while self.live_queue:
                         buffer.extend(self.live_queue.popleft())
                     
@@ -657,13 +786,11 @@ class AudioPlayer:
                         self.live_gap_repeats = 0
                         notify = True
             
-            # If we are buffering, wait until we have a safe amount of audio before playing
             if active and live_buffering and not self.live_stream_closed:
                 target_buffer_size = 5 * bytes_needed
                 if len(buffer) < target_buffer_size:
                     start_wait = time.time()
                     while len(buffer) < target_buffer_size and not self.live_stream_closed:
-                        # Max wait 200ms while buffering
                         if time.time() - start_wait > 0.20:
                             break
                         self._live_frame_event.wait(timeout=0.01)
@@ -675,7 +802,6 @@ class AudioPlayer:
                 if len(buffer) >= target_buffer_size or self.live_stream_closed:
                     live_buffering = False
 
-            # If playing but we ran out of audio, do a very quick wait
             if active and not live_buffering and len(buffer) < bytes_needed and not self.live_stream_closed:
                 start_wait = time.time()
                 while len(buffer) < bytes_needed and not self.live_stream_closed:
@@ -687,27 +813,23 @@ class AudioPlayer:
                         while self.live_queue:
                             buffer.extend(self.live_queue.popleft())
                 
-                # If we still don't have enough, enter buffering mode to rebuild the cushion
                 if len(buffer) < bytes_needed and not self.live_stream_closed:
                     live_buffering = True
 
             if active and live_buffering:
                 chunk = self._silence_chunk(num_frames or 160)
             elif len(buffer) >= bytes_needed:
-                # Extract exactly bytes_needed
                 chunk = bytes(buffer[:bytes_needed])
                 del buffer[:bytes_needed]
                 self.live_last_chunk = chunk
                 self.live_gap_repeats = 0
             elif len(buffer) > 0:
-                # Partially filled buffer, pad with silence
                 chunk = bytes(buffer)
                 chunk += b"\x00" * (bytes_needed - len(buffer))
                 buffer.clear()
                 self.live_last_chunk = chunk
                 self.live_gap_repeats = 0
             else:
-                # Completely empty buffer, handle repeats or silence
                 with self.lock:
                     still_active = bool(self.mode == "live" and not self.live_paused)
                     if (
@@ -738,7 +860,7 @@ class AudioPlayer:
                 sample_rate=8000,
             )
             gen = self._live_generator()
-            next(gen)  # Prime the generator!
+            next(gen)
             self.device.start(gen)
             return True
         except Exception:
@@ -840,7 +962,6 @@ class AudioPlayer:
                 while len(self.live_queue) > self.live_queue_max:
                     self.live_queue.popleft()
                 self._live_frame_event.set()
-        # Write WAV outside the lock so disk I/O doesn't block the audio generator
         if wav_writer is not None:
             try:
                 wav_writer.writeframesraw(pcm)
@@ -883,6 +1004,8 @@ class AudioPlayer:
         if not bid:
             return False
         with self.lock:
+            if self.device is not None and self.mode != "live":
+                self._close_device_locked()
             self.current_path = ""
             self.mode = "live"
             self.active_broadcast_id = bid
@@ -906,6 +1029,7 @@ class AudioPlayer:
             self.live_last_chunk = b""
             self.live_gap_repeats = 0
             self.playing = False
+            self._live_frame_event.set()
         self._notify()
 
     def play_recording(self, broadcast_id):
@@ -979,6 +1103,7 @@ class AudioPlayer:
                     self.live_paused = True
                     self.live_queue.clear()
                     self.playing = False
+                    self._live_frame_event.set()
                     notify = True
             if notify:
                 self._notify()
@@ -1196,6 +1321,23 @@ class WebSocketClient:
             self.sock = None
 
 
+def desktop_token_identity(token):
+    raw = str(token or "").strip()
+    if "." not in raw:
+        return ("", "", "")
+    payload_b64 = raw.rsplit(".", 1)[0]
+    padding = "=" * (-len(payload_b64) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode((payload_b64 + padding).encode("ascii")).decode("utf-8"))
+    except Exception:
+        return ("", "", "")
+    return (
+        str(payload.get("user_id") if payload.get("user_id") is not None else "").strip(),
+        str(payload.get("role") or "").strip().lower(),
+        str(payload.get("sid") or payload.get("session_id") or "").strip(),
+    )
+
+
 def text_color_for(color):
     token = str(color or "").lstrip("#")
     try:
@@ -1299,25 +1441,16 @@ INJECT_JS = r"""
   window.__opsClientInjected = true;
   window.__OPS_DESKTOP_CLIENT__ = true;
 
-  // ── Live-stream audio suppression ─────────────────────────────────────────
-  // Python's AudioPlayer owns all live-stream audio (messages, pages, bells).
-  // Make sure the WebView never opens its own WebSocket or AudioContext for it,
-  // even if pywebview was not ready when the dashboard script first ran.
   function __opsSuppressWebViewLiveAudio(){
-    // Close any browser WebSocket already opened for live audio frames
     try {
       if (typeof dashWs !== 'undefined' && dashWs) {
         dashWs.close();
         dashWs = null;
       }
     } catch (_e) {}
-    // Prevent the dashboard from (re)opening its browser WebSocket
     try {
-      if (typeof connectDashboardWebSocket !== 'undefined') {
-        connectDashboardWebSocket = function() {};
-      }
+      if (typeof connectDashboardWebSocket !== 'undefined') connectDashboardWebSocket = function() {};
     } catch (_e) {}
-    // Shut down any live ScriptProcessor AudioContext the browser may have spun up
     try {
       if (typeof dashAudioNode !== 'undefined' && dashAudioNode) {
         dashAudioNode.disconnect();
@@ -1330,55 +1463,166 @@ INJECT_JS = r"""
         dashAudioCtx = null;
       }
     } catch (_e) {}
-    // Block any stale audio frames from being queued into the (now-dead) context
     try {
       if (typeof queueLiveFrame !== 'undefined') queueLiveFrame = function() {};
     } catch (_e) {}
   }
-  __opsSuppressWebViewLiveAudio();
-  // Re-apply periodically in case dashboard scripts reinitialize after route/view changes.
-  if (!window.__opsLiveAudioSuppressTimer) {
-    window.__opsLiveAudioSuppressTimer = setInterval(__opsSuppressWebViewLiveAudio, 1500);
+
+  function __opsAbsoluteUrl(value){
+    try { return new URL(value, window.location.href).href; } catch (_e) { return ''; }
+  }
+
+  function __opsPathIsSso(path){
+    path = String(path || '').toLowerCase();
+    return path.indexOf('/login/sso') === 0 || path.indexOf('/login/oidc') === 0 || path.indexOf('/login/saml') === 0 || path.indexOf('/desktop/sso') === 0 || path.indexOf('/auth/sso') === 0 || path.indexOf('/sso/') !== -1 || path.slice(-4) === '/sso';
+  }
+
+  function __opsShouldUseExternalBrowser(value){
+    var href = __opsAbsoluteUrl(value);
+    if (!href) return false;
+    var u;
+    try { u = new URL(href); } catch (_e) { return false; }
+    var protocol = u.protocol.toLowerCase();
+    if (protocol === 'javascript:' || protocol === 'data:' || protocol === 'file:') return true;
+    if (protocol !== 'http:' && protocol !== 'https:') return true;
+    if (u.origin !== window.location.origin) return true;
+    return __opsPathIsSso(u.pathname || '');
+  }
+
+  function __opsApi(){
+    return window.pywebview && window.pywebview.api ? window.pywebview.api : null;
+  }
+
+  function __opsCallApi(name, args){
+    var api = __opsApi();
+    if (!api || typeof api[name] !== 'function') return false;
+    try {
+      var result = api[name].apply(api, args || []);
+      if (result && typeof result.catch === 'function') result.catch(function(){});
+      return true;
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  function __opsStartDesktopSso(){
+    if (!__opsCallApi('start_desktop_sso', [])) setTimeout(function(){ __opsCallApi('start_desktop_sso', []); }, 350);
+  }
+
+  function __opsOpenExternal(value){
+    var href = __opsAbsoluteUrl(value);
+    if (!href) return;
+    if (!__opsCallApi('open_external_url', [href])) setTimeout(function(){ __opsCallApi('open_external_url', [href]); }, 350);
   }
 
   function requestLogout(){
-    window.pywebview.api.confirm_logout().then(function(ok){
-      if (ok) window.location.href = '/logout';
-    });
+    var api = __opsApi();
+    if (!api || typeof api.confirm_logout !== 'function') return;
+    try {
+      var result = api.confirm_logout();
+      if (result && typeof result.then === 'function') {
+        result.then(function(ok){
+          if (ok === true) window.location.href = '/logout';
+        }).catch(function(){});
+      }
+    } catch (_e) {}
   }
-  function hookLogout(){
-    if (!window.__opsLogoutWrapped){
-      window.__opsLogoutWrapped = true;
-      window.logout = requestLogout;
-    }
-    document.querySelectorAll('.logout-btn, .logout-btn-mobile, a.logout, a[href="/logout"]').forEach(function(el){
-      if (el.__opsHooked) return;
-      el.__opsHooked = true;
-      el.removeAttribute('onclick');
-      el.addEventListener('click', function(ev){
+
+  function __opsClosest(node, selector){
+    try {
+      if (node && node.closest) return node.closest(selector);
+    } catch (_e) {}
+    return null;
+  }
+
+  window.startSsoLogin = function(){
+    __opsStartDesktopSso();
+  };
+
+  if (!window.__opsClientDelegatedEvents) {
+    window.__opsClientDelegatedEvents = true;
+    document.addEventListener('click', function(ev){
+      var logoutButton = __opsClosest(ev.target, '.logout-btn, .logout-btn-mobile, a.logout, a[href="/logout"]');
+      if (logoutButton) {
         ev.preventDefault();
         ev.stopImmediatePropagation();
         requestLogout();
-      }, true);
-    });
+        return;
+      }
+      var settingsButton = __opsClosest(ev.target, '.desktop-app-settings-btn');
+      if (settingsButton) {
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+        if (!__opsCallApi('open_app_settings', [])) window.location.href = '/desktop/app-settings';
+        return;
+      }
+      var ssoButton = __opsClosest(ev.target, '#sso-login-button');
+      if (ssoButton) {
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+        __opsStartDesktopSso();
+        return;
+      }
+      var link = __opsClosest(ev.target, 'a[href]');
+      if (!link) return;
+      var href = link.getAttribute('href') || '';
+      if (!href || href.charAt(0) === '#') return;
+      var absolute = __opsAbsoluteUrl(href);
+      var url;
+      try { url = new URL(absolute); } catch (_e) { url = null; }
+      if (url && url.origin === window.location.origin && __opsPathIsSso(url.pathname || '')) {
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+        __opsStartDesktopSso();
+        return;
+      }
+      if (__opsShouldUseExternalBrowser(href)) {
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+        __opsOpenExternal(href);
+      }
+    }, true);
+
+    document.addEventListener('submit', function(ev){
+      var form = ev.target;
+      if (!form || !form.getAttribute) return;
+      var action = form.getAttribute('action') || window.location.href;
+      var absolute = __opsAbsoluteUrl(action);
+      var url;
+      try { url = new URL(absolute); } catch (_e) { url = null; }
+      if (url && url.origin === window.location.origin && __opsPathIsSso(url.pathname || '')) {
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+        __opsStartDesktopSso();
+        return;
+      }
+      if (__opsShouldUseExternalBrowser(action)) {
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+        __opsOpenExternal(action);
+      }
+    }, true);
   }
-  function addSettingsButton(){
-    var account = document.querySelector('.sidebar-account');
-    if (!account || document.getElementById('ops-client-settings-btn')) return;
-    var link = document.createElement('a');
-    link.id = 'ops-client-settings-btn';
-    link.href = 'javascript:void(0)';
-    link.innerHTML = '<span class="nav-icon"><i class="fa-solid fa-sliders"></i></span><span class="nav-label">App Settings</span>';
-    link.addEventListener('click', function(ev){
-      ev.preventDefault();
-      window.pywebview.api.open_app_settings();
-    });
-    account.insertBefore(link, account.firstChild);
-  }
-  hookLogout();
-  addSettingsButton();
-  var observer = new MutationObserver(function(){ hookLogout(); addSettingsButton(); });
-  observer.observe(document.documentElement, {childList: true, subtree: true});
+
+  var __opsNativeWindowOpen = window.open;
+  window.open = function(url){
+    if (url && __opsShouldUseExternalBrowser(url)) {
+      var absolute = __opsAbsoluteUrl(url);
+      try {
+        var parsed = new URL(absolute);
+        if (parsed.origin === window.location.origin && __opsPathIsSso(parsed.pathname || '')) {
+          __opsStartDesktopSso();
+          return null;
+        }
+      } catch (_e) {}
+      __opsOpenExternal(url);
+      return null;
+    }
+    return __opsNativeWindowOpen.apply(window, arguments);
+  };
+
+  __opsSuppressWebViewLiveAudio();
+  if (!window.__opsLiveAudioSuppressTimer) window.__opsLiveAudioSuppressTimer = setInterval(__opsSuppressWebViewLiveAudio, 1500);
 })();
 """
 
@@ -1438,6 +1682,145 @@ class ToastCenter:
         threading.Thread(target=_show_in_thread, daemon=True).start()
 
 
+# All Tk dialogs run on this single, long-lived thread. Creating tk.Tk() roots on
+# several different threads (the startup dialog on the main thread, later dialogs
+# on assorted worker threads) is what triggered the fatal
+# "Tcl_AsyncDelete: async handler deleted by the wrong thread" abort, which then
+# surfaced downstream as bogus "not enough free memory for image buffer" errors.
+# Funnelling every dialog through one thread makes all Tcl interpreters be created
+# and destroyed on the same thread, which is safe.
+_tk_dispatch_queue = queue.Queue()
+_tk_dispatch_thread = None
+_tk_dispatch_lock = threading.Lock()
+_tk_dead_roots = []
+
+def _set_thread_dpi_unaware():
+    """Force the calling thread's DPI awareness to UNAWARE so every window created
+    on it is DPI-virtualized (bitmap-scaled) by Windows instead of receiving
+    WM_DPICHANGED. This is applied once to the shared Tk dialog thread so the small
+    dialogs (server address, app settings, SSO) stop shrinking/resizing when they
+    are dragged across the screen. It is intentionally never restored: this thread
+    only ever hosts those dialogs. The main WebView2 window lives on a different
+    thread and keeps full Per-Monitor-V2 awareness."""
+    if os.name != "nt":
+        return
+    try:
+        user32 = ctypes.windll.user32
+        user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+        user32.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(DPI_AWARENESS_CONTEXT_UNAWARE))
+    except Exception:
+        pass
+
+
+def _tk_dispatch_loop():
+    _set_thread_dpi_unaware()
+    while True:
+        fn, result_holder, done = _tk_dispatch_queue.get()
+        try:
+            result_holder["value"] = fn()
+        except Exception as exc:  # noqa: BLE001 - surfaced to the caller
+            result_holder["error"] = exc
+        finally:
+            if done is not None:
+                done.set()
+
+
+def run_on_tk_thread(fn, block=True):
+    """Run a Tk dialog callable on the shared, persistent Tk dialog thread.
+
+    Modal dialogs pass block=True and receive the dialog's return value (the
+    calling worker thread simply waits). Non-modal dialogs (the SSO window) pass
+    block=False to fire-and-forget. Because every dialog runs here, all Tk/Tcl
+    interpreters are created and torn down on one thread - no cross-thread teardown,
+    no Tcl_AsyncDelete."""
+    global _tk_dispatch_thread
+    with _tk_dispatch_lock:
+        if _tk_dispatch_thread is None or not _tk_dispatch_thread.is_alive():
+            _tk_dispatch_thread = threading.Thread(
+                target=_tk_dispatch_loop, daemon=True, name="TkDialogThread"
+            )
+            _tk_dispatch_thread.start()
+    result_holder = {}
+    done = threading.Event() if block else None
+    _tk_dispatch_queue.put((fn, result_holder, done))
+    if not block:
+        return None
+    done.wait()
+    if "error" in result_holder:
+        raise result_holder["error"]
+    return result_holder.get("value")
+
+
+def _create_dialog_tk_root():
+    """Create a Tk root for a dialog.
+
+    This always runs on the shared Tk dialog thread (see run_on_tk_thread), which
+    is permanently marked DPI-unaware (see _set_thread_dpi_unaware) so these small
+    windows are bitmap-scaled by Windows and don't shrink when moved. Running every
+    dialog on that one thread also keeps Tk stable - every Tcl interpreter is
+    created and torn down on the same thread, so the cross-thread "async handler
+    deleted by the wrong thread" abort can't happen."""
+    return tk.Tk()
+
+
+def _apply_tk_dpi_geometry(root, base_w, base_h):
+    """Center a fixed-size Tk window and scale its geometry to the current
+    monitor DPI.
+
+    Tk scales fonts (and other point-based metrics) to the display DPI but leaves
+    pixel-based geometry unscaled, so a hard-coded width/height clips the (now
+    larger) content at 125%/150% scaling. winfo_fpixels('1i') is the exact
+    pixels-per-inch Tk uses for that font scaling, so deriving the geometry scale
+    from it makes the window grow in lockstep with its content instead of
+    clipping. Returns the scale factor (1.0 at 96 DPI)."""
+    scale = 1.0
+    try:
+        root.update_idletasks()
+        ppi = root.winfo_fpixels("1i")
+        if ppi and ppi > 0:
+            scale = ppi / 96.0
+    except Exception:
+        scale = 1.0
+    if not scale or scale <= 0:
+        scale = 1.0
+    w = int(round(base_w * scale))
+    h = int(round(base_h * scale))
+    x = (root.winfo_screenwidth() - w) // 2
+    y = (root.winfo_screenheight() - h) // 2
+    root.geometry(f"{w}x{h}+{x}+{y}")
+    return scale
+
+
+def _flash_window(hwnd, count=5):
+    """Flash a window's taskbar button and title bar to grab the user's attention.
+    With FLASHW_TIMERNOFG the flashing continues until the window is brought to the
+    foreground, so the user always notices the SSO prompt even if it opened behind
+    another window."""
+    if os.name != "nt" or not hwnd:
+        return
+    try:
+        class FLASHWINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_uint),
+                ("hwnd", wintypes.HWND),
+                ("dwFlags", ctypes.c_uint),
+                ("uCount", ctypes.c_uint),
+                ("dwTimeout", ctypes.c_uint),
+            ]
+
+        info = FLASHWINFO(
+            ctypes.sizeof(FLASHWINFO),
+            wintypes.HWND(hwnd),
+            FLASHW_ALL | FLASHW_TIMERNOFG,
+            int(count),
+            0,
+        )
+        ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
+    except Exception:
+        pass
+
+
 class ServerAddressDialog:
     def __init__(self, app):
         self.app = app
@@ -1452,8 +1835,9 @@ class ServerAddressDialog:
         accent = "#1976D2"
         closed = False
         ui_queue = queue.Queue()
+        worker_threads = []
 
-        root = tk.Tk()
+        root = _create_dialog_tk_root()
         root.title(self.app.product_name)
         root.configure(bg=bg)
         root.geometry("420x520")
@@ -1468,9 +1852,7 @@ class ServerAddressDialog:
             apply_dark_titlebar(hwnd, dark)
         except Exception:
             pass
-        screen_w = root.winfo_screenwidth()
-        screen_h = root.winfo_screenheight()
-        root.geometry(f"420x520+{(screen_w - 420) // 2}+{(screen_h - 520) // 2}")
+        _apply_tk_dpi_geometry(root, 420, 520)
 
         def close(result=None):
             nonlocal closed
@@ -1481,10 +1863,6 @@ class ServerAddressDialog:
                 self.result = result
             try:
                 root.quit()
-            except Exception:
-                pass
-            try:
-                root.destroy()
             except Exception:
                 pass
 
@@ -1559,14 +1937,14 @@ class ServerAddressDialog:
                 def confirm_http(origin):
                     return native_message_box(
                         self.app.product_name,
-                        f"{origin} does not support SSL. Do you want to continue?",
+                        f"{origin} does not support a secure connection. Content sent is not encrypted while in transit. Avoid sending private or confidential information if possible until this is resolved. Do you want to continue?",
                         MB_YESNO | MB_ICONWARNING,
                     ) == IDYES
 
                 def confirm_cert(host):
                     accepted = native_message_box(
                         self.app.product_name,
-                        f"The security certificate presented by {host} is not trusted. Do you want to continue anyway?",
+                        f"The security certificate presented by {host} is not trusted. Content sent is not encrypted while in transit. It's not recommended to continue and you should contact your system administrator to resolve this issue as soon as possible. Do you want to continue anyway?",
                         MB_YESNO | MB_ICONWARNING,
                     ) == IDYES
                     if accepted:
@@ -1584,7 +1962,9 @@ class ServerAddressDialog:
                     return
                 schedule(lambda: close((value, info, origin)))
 
-            threading.Thread(target=worker, daemon=True).start()
+            worker_thread = threading.Thread(target=worker, daemon=True)
+            worker_threads.append(worker_thread)
+            worker_thread.start()
 
         login_button = tk.Button(
             root, text="CONNECT", command=do_login, font=button_font,
@@ -1613,11 +1993,22 @@ class ServerAddressDialog:
         try:
             root.mainloop()
         finally:
+            # Join any in-flight connect worker before tearing down the Tk objects.
+            for worker_thread in worker_threads:
+                try:
+                    worker_thread.join()
+                except Exception:
+                    pass
             try:
                 logo_label.configure(image="")
                 logo_label.image = None
             except Exception:
                 pass
+            try:
+                root.destroy()
+            except Exception:
+                pass
+            _tk_dead_roots.append(root)
         return self.result
 
 
@@ -1633,14 +2024,16 @@ class AppSettingsWindow:
         dark = system_uses_dark_mode()
         bg = "#1F1F1F" if dark else "#FFFFFF"
         fg = "#EEEEEE" if dark else "#1A1A1A"
+        subtle = "#9E9E9E" if dark else "#666666"
         accent = "#1976D2"
         red = "#C62828"
         closed = False
+        self.action = None
 
-        root = tk.Tk()
+        root = _create_dialog_tk_root()
         root.title("App Settings")
         root.configure(bg=bg)
-        root.geometry("380x390")
+        root.geometry("380x580")
         root.resizable(False, False)
         try:
             root.iconbitmap(app_ico_path())
@@ -1651,7 +2044,7 @@ class AppSettingsWindow:
             apply_dark_titlebar(ctypes.windll.user32.GetParent(root.winfo_id()), dark)
         except Exception:
             pass
-        root.geometry(f"380x390+{(root.winfo_screenwidth() - 380) // 2}+{(root.winfo_screenheight() - 390) // 2}")
+        _apply_tk_dpi_geometry(root, 380, 580)
 
         def close():
             nonlocal closed
@@ -1662,12 +2055,26 @@ class AppSettingsWindow:
                 root.quit()
             except Exception:
                 pass
-            try:
-                root.destroy()
-            except Exception:
-                pass
 
-        tk.Label(root, text="App Settings", bg=bg, fg=fg, font=tkfont.Font(family="Segoe UI", size=13, weight="bold")).pack(pady=(22, 16))
+        tk.Label(root, text="App Settings", bg=bg, fg=fg, font=tkfont.Font(family="Segoe UI", size=13, weight="bold")).pack(pady=(22, 12))
+
+        info_font = tkfont.Font(family="Segoe UI", size=9)
+        tk.Label(
+            root,
+            text="Open Paging Server Desktop Client 0.1.0",
+            bg=bg, fg=fg, font=tkfont.Font(family="Segoe UI", size=9, weight="bold"),
+            wraplength=340, justify="center",
+        ).pack(padx=20, pady=(0, 8))
+        tk.Label(
+            root,
+            text="Open Paging Server is licensed under the GNU General Public License v2.0. Third-party components, modules, and software used by Open Paging Server are subject to their own licenses.",
+            bg=bg, fg=subtle, font=info_font, wraplength=340, justify="center",
+        ).pack(padx=20, pady=(0, 8))
+        tk.Label(
+            root,
+            text="Open Paging Server is provided \"as is\" without any warranties, express or implied, including but not limited to fitness for a particular purpose or non-infringement.",
+            bg=bg, fg=subtle, font=info_font, wraplength=340, justify="center",
+        ).pack(padx=20, pady=(0, 16))
 
         button_font = tkfont.Font(family="Segoe UI", size=10, weight="bold")
         normal_font = tkfont.Font(family="Segoe UI", size=11)
@@ -1712,9 +2119,13 @@ class AppSettingsWindow:
                 MB_YESNO | MB_ICONQUESTION,
             )
             if answer == IDYES:
+                # Defer the actual disconnect/server-dialog until run() has
+                # returned and open_app_settings() has released tk_lock. Doing it
+                # here would spawn show_server_dialog() while this window still
+                # holds tk_lock, so its non-blocking acquire fails and the server
+                # address page never appears (app appears hung until restart).
+                self.action = "disconnect"
                 close()
-                self.app.disconnect_from_server()
-                threading.Thread(target=self.app.show_server_dialog, daemon=True).start()
 
         def do_close_client():
             answer = native_message_box(
@@ -1737,7 +2148,190 @@ class AppSettingsWindow:
             relief="flat", cursor="hand2", padx=20, pady=8, borderwidth=0, font=button_font,
         ).pack()
         root.protocol("WM_DELETE_WINDOW", close)
-        root.mainloop()
+        try:
+            root.mainloop()
+        finally:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+            _tk_dead_roots.append(root)
+        return self.action
+
+
+class DesktopSsoWindow:
+    def __init__(self, app, browser_url):
+        self.app = app
+        self.browser_url = str(browser_url or "")
+        self.thread = None
+        self._started = False
+        self.root = None
+        self.status_label = None
+        self.ui_queue = queue.Queue()
+        self.closed = threading.Event()
+        self.cancelled = threading.Event()
+
+    def start(self):
+        if self._started:
+            return
+        self._started = True
+        # Run on the shared Tk dialog thread (non-blocking) so this window shares
+        # the single Tcl interpreter thread with every other dialog.
+        run_on_tk_thread(self.run, block=False)
+
+    def enqueue(self, callback):
+        try:
+            self.ui_queue.put(callback)
+        except Exception:
+            pass
+
+    def bring_to_front(self):
+        def worker():
+            root = self.root
+            if root is None:
+                return
+            try:
+                root.deiconify()
+                root.lift()
+                # Keep the prompt persistently on top (do not drop -topmost) so it
+                # can't be lost behind the browser window opened for SSO.
+                root.attributes("-topmost", True)
+                root.focus_force()
+            except Exception:
+                pass
+            try:
+                hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+            except Exception:
+                hwnd = 0
+            if hwnd:
+                _flash_window(hwnd)
+        self.enqueue(worker)
+
+    def set_status(self, text, error=False):
+        def worker():
+            if self.status_label is None:
+                return
+            dark = system_uses_dark_mode()
+            color = "#EF9A9A" if error and dark else "#C62828" if error else "#BBBBBB" if dark else "#555555"
+            try:
+                self.status_label.configure(text=str(text or ""), fg=color)
+            except Exception:
+                pass
+        self.enqueue(worker)
+
+    def close(self):
+        def worker():
+            if self.closed.is_set():
+                return
+            self.closed.set()
+            root = self.root
+            if root is None:
+                return
+            try:
+                root.quit()
+            except Exception:
+                pass
+        self.enqueue(worker)
+
+    def cancel(self):
+        self.cancelled.set()
+        self.close()
+
+    def run(self):
+        if not self.app.tk_lock.acquire(blocking=False):
+            return
+        self.app.set_main_window_enabled(False)
+        try:
+            dark = system_uses_dark_mode()
+            bg = "#1F1F1F" if dark else "#FFFFFF"
+            fg = "#EEEEEE" if dark else "#1A1A1A"
+            subtle = "#BBBBBB" if dark else "#555555"
+            accent = "#1976D2"
+            root = _create_dialog_tk_root()
+            self.root = root
+            root.title(self.app.product_name)
+            root.configure(bg=bg)
+            root.geometry("440x330")
+            root.resizable(False, False)
+            try:
+                root.iconbitmap(app_ico_path())
+            except Exception:
+                pass
+            root.update_idletasks()
+            try:
+                apply_dark_titlebar(ctypes.windll.user32.GetParent(root.winfo_id()), dark)
+            except Exception:
+                pass
+            _apply_tk_dpi_geometry(root, 440, 330)
+            try:
+                sso_hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+            except Exception:
+                sso_hwnd = 0
+            try:
+                root.attributes("-topmost", True)
+                root.lift()
+                root.focus_force()
+            except Exception:
+                pass
+            if sso_hwnd:
+                _flash_window(sso_hwnd)
+            title_font = tkfont.Font(family="Segoe UI", size=15, weight="bold")
+            body_font = tkfont.Font(family="Segoe UI", size=10)
+            icon_font = tkfont.Font(family="Segoe UI Symbol", size=36, weight="bold")
+            button_font = tkfont.Font(family="Segoe UI", size=10, weight="bold")
+            tk.Label(root, text="↗", bg=bg, fg=accent, font=icon_font).pack(pady=(28, 8))
+            tk.Label(root, text="Continue login in your browser", bg=bg, fg=fg, font=title_font).pack(pady=(0, 32))
+            
+            button_row = tk.Frame(root, bg=bg)
+            button_row.pack(pady=(0, 22))
+            tk.Button(
+                button_row,
+                text="CANCEL",
+                command=self.cancel,
+                bg=bg,
+                fg=fg,
+                activebackground=bg,
+                activeforeground=fg,
+                relief="groove",
+                cursor="hand2",
+                padx=16,
+                pady=7,
+                borderwidth=1,
+                font=button_font,
+            ).pack(side="left")
+
+            def drain_queue():
+                while True:
+                    try:
+                        callback = self.ui_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    try:
+                        callback()
+                    except Exception:
+                        pass
+                if not self.closed.is_set():
+                    try:
+                        root.after(50, drain_queue)
+                    except Exception:
+                        pass
+
+            root.after(50, drain_queue)
+            root.protocol("WM_DELETE_WINDOW", self.cancel)
+            try:
+                root.mainloop()
+            finally:
+                self.closed.set()
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+                _tk_dead_roots.append(root)
+                self.root = None
+                self.status_label = None
+        finally:
+            self.app.set_main_window_enabled(True)
+            self.app.tk_lock.release()
 
 class ClientApp:
     def __init__(self):
@@ -1749,13 +2343,27 @@ class ClientApp:
         self.user_id = self.config.get("user_id")
         self.product_name = str(self.config.get("product_name") or APP_FALLBACK_NAME)
         self.guest_available = bool(self.config.get("guest_available"))
+        self.sso_provider = str(self.config.get("sso_provider") or "")
+        self.desktop_sso_start_path = str(self.config.get("desktop_sso_start_path") or "/desktop/sso/start")
+        self.desktop_sso_poll_path = str(self.config.get("desktop_sso_poll_path") or "/desktop/sso/poll")
         self.ws = None
         self.ws_thread = None
         self.tray = None
         self.main_window = None
+        self.gui_thread_id = None
         self.popups = {}
         self.connected = False
         self.startup_check_done = False
+        self.disconnect_since = None
+        self.offline_notified = False
+        self.pending_welcome = False
+        self.launched_at_startup = False
+        self.start_minimized = False
+        self._show_event_handle = None
+        self.error_page_active = False
+        self.error_retry_target = ""
+        self.error_retry_stop = threading.Event()
+        self.error_lock = threading.Lock()
         self.reconnect_stop = threading.Event()
         self.seen_broadcasts = set()
         self.tk_lock = threading.Lock()
@@ -1765,8 +2373,16 @@ class ClientApp:
         self.cert_prompt_shown = False
         self.current_url = ""
         self.popup_close_confirming = threading.Event()
+        self.tray_refresh_stop = threading.Event()
+        self.tray_lock = threading.Lock()
+        self.sso_lock = threading.Lock()
+        self.web_session_sync_lock = threading.Lock()
+        self.sso_active = False
+        self.sso_prompt = None
         INSECURE_HOSTS.update(str(host) for host in (self.config.get("insecure_hosts") or []))
         self.audio = AudioPlayer(on_state_change=self._on_audio_state_change)
+        if self.config.get("clear_webview_storage"):
+            self.delete_webview_storage()
         self.persist_session_state()
 
     def main_window_hwnd(self):
@@ -1782,6 +2398,93 @@ class ClientApp:
             return int(hwnd or 0)
         except Exception:
             return 0
+
+    def set_main_window_enabled(self, enabled):
+        if os.name != "nt":
+            return False
+        hwnd = self.main_window_hwnd()
+        if not hwnd:
+            return False
+        try:
+            ctypes.windll.user32.EnableWindow(hwnd, bool(enabled))
+            if enabled:
+                try:
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+            return True
+        except Exception:
+            return False
+
+    def _window_invoke(self, callback, window=None):
+        target = window or self.main_window
+        if callback is None or target is None:
+            return None
+        if getattr(target, "native", None) is None:
+            return None
+        if self.gui_thread_id is not None and threading.get_ident() == self.gui_thread_id:
+            return callback(target)
+        try:
+            return callback(target)
+        except Exception:
+            return None
+
+    def _window_eval_js(self, script, window=None, timeout=15):
+        # evaluate_js can block indefinitely (e.g. if the page navigates away
+        # mid-call), so run it on a worker thread and give up after a timeout
+        # instead of hanging the caller.
+        target = window or self.main_window
+        if target is None or getattr(target, "native", None) is None:
+            return None
+        result = {}
+        done = threading.Event()
+
+        def run():
+            try:
+                result["value"] = target.evaluate_js(script)
+            except Exception:
+                result["value"] = None
+            finally:
+                done.set()
+
+        threading.Thread(target=run, daemon=True).start()
+        if not done.wait(timeout):
+            return None
+        return result.get("value")
+
+    def _window_load_url(self, url, window=None):
+        self._window_invoke(lambda win: win.load_url(url), window=window)
+
+    def _window_get_current_url(self, window=None):
+        # window.get_current_url() waits (up to 20s) for pywebview's "loaded"
+        # event, which freezes callers - notably the UI thread during
+        # before_load. Read the renderer's cached URL directly instead.
+        target = window or self.main_window
+        if target is None:
+            return ""
+        try:
+            browser = getattr(getattr(target, "native", None), "browser", None)
+            url = getattr(browser, "url", None)
+            if url is not None:
+                return str(url)
+        except Exception:
+            pass
+        return str(self.current_url or "")
+
+    def _window_show_restore(self, window=None):
+        def action(win):
+            win.show()
+            win.restore()
+        self._window_invoke(action, window=window)
+
+    def _window_hide(self, window=None):
+        self._window_invoke(lambda win: win.hide(), window=window)
+
+    def _window_destroy(self, window=None):
+        self._window_invoke(lambda win: win.destroy(), window=window)
+
+    def _window_set_title(self, title, window=None):
+        self._window_invoke(lambda win: win.set_title(title), window=window)
 
     def apply_native_icon(self, window):
         def worker():
@@ -1805,7 +2508,6 @@ class ClientApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_audio_state_change(self, playing):
-        """Push audio state to webview dashboard without using async API callbacks."""
         window = self.main_window
         if window is None:
             return
@@ -1814,14 +2516,13 @@ class ClientApp:
         bid = str(self.audio.active_broadcast_id or "")
         js_playing = "true" if playing else "false"
         try:
-            window.evaluate_js(
+            self._window_eval_js(
                 f"if(typeof window.__opsUpdateAudioState==='function'){{window.__opsUpdateAudioState({json.dumps(bid)},{js_playing});}}"
             )
         except Exception:
             pass
 
     def _force_popup_focus(self, windows, monitor_bounds):
-        """Force popup windows topmost, focused, and completely unmovable via WndProc hook + snap loop."""
         def worker():
             time.sleep(0.5)
             HWND_TOPMOST = -1
@@ -1902,8 +2603,6 @@ class ClientApp:
                 hwnd_bounds.append((hwnd, bounds))
                 _hook_no_move(hwnd)
 
-            # Snap loop: reposition aggressively as secondary defense against movement.
-            # Also acts as a watchdog — auto-closes on repeated errors.
             error_count = 0
             max_errors = 12
             last_focus_attempt = 0.0
@@ -1938,13 +2637,12 @@ class ClientApp:
                     activate_window(alive_hwnds[0])
                     last_focus_attempt = now
                 if error_count >= max_errors:
-                    # Too many errors — force-close all popups and notify user
                     try:
                         for pop_id, wins in list(self.popups.items()):
                             self.popups.pop(pop_id, None)
                             for w in wins:
                                 try:
-                                    w.destroy()
+                                    self._window_destroy(window=w)
                                 except Exception:
                                     pass
                     except Exception:
@@ -1975,18 +2673,42 @@ class ClientApp:
                     MB_YESNO | MB_ICONWARNING,
                     owner=app.main_window_hwnd(),
                 )
-                return answer == IDYES
+                if answer == IDYES:
+                    # Run the logout (which navigates the webview) after this
+                    # JS-API call returns. Navigating synchronously here would
+                    # destroy pywebview's pending return-value callback for this
+                    # call and raise a JavascriptException on the resolver thread.
+                    threading.Thread(target=lambda: app.logout(rebuild_guest=True), daemon=True).start()
+                return False
 
             def request_close_popup(self, popup_id):
                 threading.Thread(target=app.confirm_close_emergency, args=(str(popup_id),), daemon=True).start()
                 return True
 
             def dashboard_toggle_audio(self, broadcast_id):
-                playing = app.audio.toggle_dashboard_audio(str(broadcast_id or "").strip())
+                bid = str(broadcast_id or "").strip()
+                before = app.audio.dashboard_audio_state(bid)
+                playing = app.audio.toggle_dashboard_audio(bid)
+                if not playing and not bool(before.get("playing")) and bid and app.origin:
+                    try:
+                        path = http_download(app.origin, "/desktop/broadcasts/" + urllib.parse.quote(bid) + "/audio", app.token, default_suffix=".wav")
+                        playing = app.audio.play_file(path)
+                    except Exception:
+                        playing = False
                 return {"ok": True, "playing": bool(playing)}
 
             def dashboard_audio_state(self, broadcast_id):
                 return app.audio.dashboard_audio_state(str(broadcast_id or "").strip())
+
+            def open_external_url(self, url):
+                return app.handle_external_url_request(str(url or ""))
+
+            def start_desktop_sso(self):
+                return app.start_desktop_sso_flow()
+
+            def retry_webview(self):
+                threading.Thread(target=app.retry_webview, daemon=True).start()
+                return True
 
         return Api()
 
@@ -2001,7 +2723,7 @@ class ClientApp:
             self.tray.title = self.tray_tooltip()
         if self.main_window is not None:
             try:
-                self.main_window.set_title(cleaned)
+                self._window_set_title(cleaned)
             except Exception:
                 pass
         if self.toasts is not None:
@@ -2018,16 +2740,29 @@ class ClientApp:
         return tinted_favicon(COLOR_CONNECTED if self.connected else COLOR_DISCONNECTED)
 
     def refresh_tray(self):
-        if self.tray is None:
+        tray = self.tray
+        if tray is None:
             return
-        try:
-            self.tray.icon = self.tray_icon_image()
-        except Exception:
-            pass
-        try:
-            self.tray.title = self.tray_tooltip()
-        except Exception:
-            pass
+        with self.tray_lock:
+            try:
+                tray.icon = self.tray_icon_image().copy()
+            except Exception:
+                pass
+            try:
+                tray.title = self.tray_tooltip()
+            except Exception:
+                pass
+            try:
+                tray.update_menu()
+            except Exception:
+                pass
+
+    def tray_refresh_loop(self):
+        while not self.tray_refresh_stop.is_set():
+            delay = 0.75 if time.time() < self.receive_flash_until else 2.0
+            if self.tray_refresh_stop.wait(delay):
+                break
+            self.refresh_tray()
 
     def flash_receiving(self):
         self.receive_flash_until = time.time() + 4
@@ -2045,27 +2780,53 @@ class ClientApp:
             pystray.MenuItem("Stop audio", lambda: threading.Thread(target=self.audio.stop, daemon=True).start()),
             pystray.MenuItem("App Settings", lambda: threading.Thread(target=self.open_app_settings, daemon=True).start()),
         )
-        self.tray = pystray.Icon("OpenPagingServerClient", self.tray_icon_image(), self.tray_tooltip(), menu)
+        self.tray_refresh_stop.clear()
+        self.tray = pystray.Icon("OpenPagingServerClient", self.tray_icon_image().copy(), self.tray_tooltip(), menu)
         threading.Thread(target=self.tray.run, daemon=True).start()
+        threading.Thread(target=self.tray_refresh_loop, daemon=True).start()
         self.toasts = ToastCenter(self)
 
     def set_status(self, connected):
+        connected = bool(connected)
         was_connected = self.connected
         self.connected = connected
         if connected:
             self.auth_notified = False
+            self.disconnect_since = None
+            if self.offline_notified:
+                self.offline_notified = False
+                self.notify(
+                    f"Reconnected to {self.product_name}",
+                    "You will now be able to receive pages and emergency notifications.",
+                )
+        else:
+            if self.disconnect_since is None:
+                self.disconnect_since = time.time()
+            if not self.offline_notified and (time.time() - self.disconnect_since) >= 30:
+                self.offline_notified = True
+                self.notify(
+                    f"Unable to connect to {self.product_name}",
+                    "You won't be able to receive pages and emergency notifications. "
+                    "We'll retry the connection in the background.",
+                )
         self.refresh_tray()
+
+        def delayed_refresh():
+            time.sleep(0.35)
+            self.refresh_tray()
+            time.sleep(1.25)
+            self.refresh_tray()
+
+        threading.Thread(target=delayed_refresh, daemon=True).start()
         if connected and not was_connected:
             self.maybe_show_welcome_toast()
 
     def maybe_show_welcome_toast(self):
-        key = "welcomed:" + self.origin
-        if self.config.get(key):
+        if not self.pending_welcome:
             return
-        self.config[key] = True
-        save_config(self.config)
+        self.pending_welcome = False
         self.notify(
-            f'Connected to {self.product_name}',
+            f"Connected to {self.product_name}",
             "You are now ready to receive pages and emergency notifications from your organization.",
         )
 
@@ -2078,7 +2839,7 @@ class ClientApp:
     def _desktop_page_path(self, path=""):
         raw = str(path or "").strip()
         if not raw:
-            raw = "/" if not self.token or self.role == "guest" else "/dashboard"
+            raw = "/"
         if raw.startswith("http://") or raw.startswith("https://"):
             return raw
         if not raw.startswith("/"):
@@ -2087,39 +2848,454 @@ class ClientApp:
             return raw
         return raw + ("&" if "?" in raw else "?") + "desktop_client=1"
 
+    def _url_origin_parts(self, value):
+        parsed = urllib.parse.urlparse(str(value or ""))
+        scheme = str(parsed.scheme or "").lower()
+        host = str(parsed.hostname or "").lower()
+        if not scheme or not host:
+            return None
+        port = parsed.port
+        if port is None:
+            port = 443 if scheme == "https" else 80 if scheme == "http" else None
+        return scheme, host, port
+
+    def is_server_url(self, url):
+        if not self.origin:
+            return False
+        return self._url_origin_parts(url) == self._url_origin_parts(self.origin)
+
+    def is_allowed_webview_url(self, url):
+        raw = str(url or "").strip()
+        if not raw or raw == "about:blank":
+            return True
+        parsed = urllib.parse.urlparse(raw)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        return self.is_server_url(raw)
+
+    def is_sso_url(self, url):
+        raw = str(url or "").strip().lower()
+        if not raw:
+            return False
+        try:
+            parsed = urllib.parse.urlparse(raw)
+        except Exception:
+            return False
+        path = (parsed.path or "").lower()
+        prefixes = ("/login/sso", "/login/oidc", "/login/saml", "/desktop/sso", "/auth/sso")
+        return path.startswith(prefixes) or "/sso/" in path or path.endswith("/sso")
+
+    def open_in_default_browser(self, url):
+        raw = str(url or "").strip()
+        if not raw:
+            return False
+        try:
+            parsed = urllib.parse.urlparse(raw)
+        except Exception:
+            return False
+        if parsed.scheme.lower() not in EXTERNAL_BROWSER_SCHEMES:
+            return False
+        try:
+            webbrowser.open(raw)
+            return True
+        except Exception:
+            return False
+
+    def safe_main_url(self):
+        if not self.origin:
+            return "about:blank"
+        return self.origin.rstrip("/") + self._desktop_page_path("/")
+
+    def return_to_safe_main_url(self):
+        window = self.main_window
+        if window is None:
+            return
+        target = self.safe_main_url()
+        try:
+            self._window_load_url(target, window=window)
+            self.current_url = target
+        except Exception:
+            pass
+
+    def _deferred_return_to_safe_main_url(self, delay=0.05):
+        # Navigating the webview synchronously from inside a pywebview JS-API
+        # method (e.g. open_external_url) destroys the pending return-value
+        # callback for that call and raises a JavascriptException
+        # ("_returnValuesCallbacks.<method> is not a function"). Deferring the
+        # navigation to a worker thread lets the JS-API call resolve first.
+        def run():
+            if delay:
+                time.sleep(delay)
+            self.return_to_safe_main_url()
+        threading.Thread(target=run, daemon=True).start()
+
+    def handle_external_url_request(self, url):
+        raw = str(url or "").strip()
+        if not raw:
+            return False
+        if self.is_server_url(raw) and self.is_sso_url(raw):
+            self.start_desktop_sso_flow()
+            self._deferred_return_to_safe_main_url()
+            return True
+        if self.is_allowed_webview_url(raw) and not self.is_sso_url(raw):
+            return False
+        opened = self.open_in_default_browser(raw)
+        self._deferred_return_to_safe_main_url()
+        return bool(opened)
+
+    def start_desktop_sso_flow(self):
+        if not self.origin:
+            return False
+        with self.sso_lock:
+            if self.sso_active:
+                prompt = self.sso_prompt
+                if prompt is not None:
+                    prompt.bring_to_front()
+                return True
+            old_prompt = self.sso_prompt
+            self.sso_prompt = None
+            self.sso_active = True
+        if old_prompt is not None:
+            old_prompt.close()
+
+        def worker():
+            prompt = None
+            try:
+                start_path = self.desktop_sso_start_path or "/desktop/sso/start"
+                started, _url = http_json(self.origin, start_path, method="POST", timeout=10)
+                browser_url = str(started.get("browser_url") or "").strip()
+                request_id = str(started.get("request_id") or "").strip()
+                request_secret = str(started.get("request_secret") or "").strip()
+                if not browser_url or not request_id or not request_secret:
+                    raise RuntimeError("The server did not return a valid desktop SSO request.")
+                prompt = DesktopSsoWindow(self, browser_url)
+                with self.sso_lock:
+                    self.sso_prompt = prompt
+                prompt.start()
+                self.open_in_default_browser(browser_url)
+                self.poll_desktop_sso(started, prompt)
+            except Exception as exc:
+                message = "Could not start desktop SSO: " + str(exc)
+                if prompt is not None:
+                    prompt.set_status(message, True)
+                else:
+                    native_message_box(self.product_name, message, MB_ICONWARNING, owner=self.main_window_hwnd())
+            finally:
+                with self.sso_lock:
+                    self.sso_active = False
+                    if self.sso_prompt is prompt and prompt is not None and prompt.closed.is_set():
+                        self.sso_prompt = None
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def poll_desktop_sso(self, started, prompt=None):
+        request_id = str((started or {}).get("request_id") or "").strip()
+        request_secret = str((started or {}).get("request_secret") or "").strip()
+        poll_path = str((started or {}).get("poll_path") or self.desktop_sso_poll_path or "/desktop/sso/poll").strip()
+        try:
+            expires_in = int((started or {}).get("expires_in") or 600)
+        except Exception:
+            expires_in = 600
+        deadline = time.time() + max(30, min(expires_in, 1800))
+        while time.time() < deadline and not self.reconnect_stop.is_set():
+            if prompt is not None and prompt.cancelled.is_set():
+                return False
+            try:
+                session, _url = http_json(
+                    self.origin,
+                    poll_path,
+                    method="POST",
+                    body={"request_id": request_id, "request_secret": request_secret},
+                    timeout=10,
+                )
+            except urllib.error.HTTPError as exc:
+                if exc.code in (202, 408, 429, 500, 502, 503, 504):
+                    time.sleep(2)
+                    continue
+                message = "Desktop SSO did not complete."
+                if prompt is not None:
+                    prompt.set_status(message, True)
+                return False
+            except Exception:
+                time.sleep(2)
+                continue
+            status = str((session or {}).get("status") or "").strip().lower()
+            if status == "pending":
+                time.sleep(2)
+                continue
+            token = str((session or {}).get("token") or "")
+            if token:
+                self.pending_welcome = True
+                self.apply_session(session)
+                self.start_reconnect_loop()
+                if prompt is not None:
+                    prompt.close()
+                self.show_main_window("/")
+                return True
+            if status in {"failed", "expired", "consumed"}:
+                message = str((session or {}).get("error") or "Desktop SSO did not complete.")
+                if prompt is not None:
+                    prompt.set_status(message, True)
+                return False
+            time.sleep(2)
+        if prompt is not None:
+            prompt.set_status("Desktop SSO timed out. Try logging in again.", True)
+        return False
+
     def show_main_window(self, path=""):
         window = self.main_window
         if window is None:
             return
         try:
-            window.show()
-            window.restore()
+            self._window_show_restore(window=window)
         except Exception:
             pass
         if not self.origin:
             return
-        target = self.origin + self._desktop_page_path(path)
-        if path or not self.current_url.startswith(self.origin):
+        page = self._desktop_page_path(path)
+        target = page if page.startswith("http://") or page.startswith("https://") else self.origin.rstrip("/") + page
+        if not self.is_allowed_webview_url(target):
+            self.open_in_default_browser(target)
+            target = self.safe_main_url()
+        if path or not self.is_server_url(self.current_url) or self.error_page_active:
+            self.load_server_url(target, window=window)
+
+    def _has_internet(self):
+        for host in (("1.1.1.1", 53), ("8.8.8.8", 53), ("208.67.222.222", 53)):
             try:
-                window.load_url(target)
+                sock = socket.create_connection(host, timeout=3)
+                sock.close()
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _probe_origin(self, timeout=6):
+        """Return "" when the server is reachable, else a webview error type."""
+        origin = str(self.origin or "").strip()
+        if not origin:
+            return "unable"
+        url = origin.rstrip("/") + "/"
+        try:
+            request = urllib.request.Request(url, method="GET")
+            request.add_header(DESKTOP_CLIENT_HEADER, "1")
+            with urllib.request.urlopen(request, timeout=timeout, context=request_ssl_context(url)):
+                return ""
+        except urllib.error.HTTPError:
+            # The server responded (even with an error status): it is reachable.
+            return ""
+        except (socket.timeout, TimeoutError):
+            return "timeout"
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, ConnectionRefusedError):
+                return "refused"
+            if isinstance(reason, (socket.timeout, TimeoutError)):
+                return "timeout"
+            if isinstance(reason, ssl.SSLError):
+                return "unable"
+            if not self._has_internet():
+                return "no_internet"
+            if isinstance(reason, ConnectionResetError):
+                return "refused"
+            return "unable"
+        except ConnectionRefusedError:
+            return "refused"
+        except Exception:
+            if not self._has_internet():
+                return "no_internet"
+            return "unable"
+
+    def _webview_error_html(self, error_type):
+        catalog = {
+            "refused": ("Connection refused", "Please ensure the server address is up-to-date and try again.", "network"),
+            "timeout": ("Connection timeout", "Please check your network connection and try again.", "network"),
+            "no_internet": ("No internet connection", "Please check your network connection and try again.", "network"),
+            "unable": ("Unable to load page", "Please contact your system administrator if this issue persists.", "warning"),
+            "failed": ("Failed to load page", "Please contact your system administrator if this issue persists.", "warning"),
+            "fatal": ("Fatal page error", "Please contact your system administrator if this issue persists.", "warning"),
+        }
+        title, submessage, icon_kind = catalog.get(error_type, catalog["failed"])
+        dark = system_uses_dark_mode()
+        bg = "#1B1B1B" if dark else "#F5F6F8"
+        card_bg = "#262626" if dark else "#FFFFFF"
+        fg = "#F1F1F1" if dark else "#1A1A1A"
+        subtle = "#B0B0B0" if dark else "#5F6368"
+        accent = "#1976D2"
+        border = "#3A3A3A" if dark else "#E0E0E0"
+        icon_color = "#E53935"
+        if icon_kind == "network":
+            icon_svg = (
+                f'<svg viewBox="0 0 24 24" width="72" height="72" fill="none" stroke="{icon_color}" '
+                'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+                '<path d="M1 1l22 22"/><path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"/>'
+                '<path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"/>'
+                '<path d="M10.71 5.05A16 16 0 0 1 22.58 9"/>'
+                '<path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"/>'
+                '<path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>'
+            )
+        else:
+            icon_svg = (
+                f'<svg viewBox="0 0 24 24" width="72" height="72" fill="none" stroke="{icon_color}" '
+                'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+                '<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="13"/>'
+                '<line x1="12" y1="16" x2="12.01" y2="16"/></svg>'
+            )
+        product = html_escape(self.product_name)
+        title_h = html_escape(title)
+        sub_h = html_escape(submessage)
+        return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  * {{ box-sizing: border-box; }}
+  html, body {{ height: 100%; margin: 0; }}
+  body {{ background: {bg}; color: {fg}; font-family: "Segoe UI", system-ui, sans-serif;
+          display: flex; align-items: center; justify-content: center; }}
+  .card {{ background: {card_bg}; border: 1px solid {border}; border-radius: 14px; padding: 40px 44px;
+           max-width: 460px; width: calc(100% - 48px); text-align: center;
+           box-shadow: 0 10px 40px rgba(0,0,0,0.18); }}
+  .icon {{ margin-bottom: 18px; }}
+  h1 {{ font-size: 22px; margin: 0 0 10px; font-weight: 600; }}
+  p.sub {{ color: {subtle}; font-size: 14px; margin: 0 0 8px; line-height: 1.5; }}
+  p.retry {{ color: {subtle}; font-size: 12.5px; margin: 18px 0 22px; }}
+  .actions {{ display: flex; gap: 12px; justify-content: center; }}
+  button {{ font-family: inherit; font-size: 14px; font-weight: 600; border: none; border-radius: 8px;
+            padding: 11px 22px; cursor: pointer; }}
+  .primary {{ background: {accent}; color: #fff; }}
+  .primary:hover {{ background: #1565C0; }}
+  .secondary {{ background: transparent; color: {fg}; border: 1px solid {border}; }}
+  .secondary:hover {{ border-color: {accent}; color: {accent}; }}
+</style></head>
+<body>
+  <div class="card">
+    <div class="icon">{icon_svg}</div>
+    <h1>{title_h}</h1>
+    <p class="sub">We couldn't reach {product}.</p>
+    <p class="sub">{sub_h}</p>
+    <p class="retry" id="retry-status">Retrying automatically in <span id="count">10</span>s&hellip;</p>
+    <div class="actions">
+      <button class="primary" onclick="doRetry()">Retry</button>
+      <button class="secondary" onclick="openSettings()">App Settings</button>
+    </div>
+  </div>
+  <script>
+    var remaining = 10;
+    var timer = setInterval(function() {{
+      remaining -= 1;
+      if (remaining < 0) remaining = 10;
+      var el = document.getElementById('count');
+      if (el) el.textContent = remaining;
+    }}, 1000);
+    function api() {{ return (window.pywebview && window.pywebview.api) ? window.pywebview.api : null; }}
+    function doRetry() {{
+      var status = document.getElementById('retry-status');
+      if (status) status.textContent = 'Retrying\u2026';
+      var a = api();
+      if (a && a.retry_webview) a.retry_webview();
+    }}
+    function openSettings() {{
+      var a = api();
+      if (a && a.open_app_settings) a.open_app_settings();
+    }}
+  </script>
+</body></html>"""
+
+    def _clear_error_page(self):
+        with self.error_lock:
+            self.error_page_active = False
+            self.error_retry_stop.set()
+
+    def load_server_url(self, target, window=None):
+        window = window or self.main_window
+        if window is None:
+            return
+        # Fast path: a healthy realtime connection means the server is reachable.
+        if self.connected:
+            self._clear_error_page()
+            try:
+                self._window_load_url(target, window=window)
                 self.current_url = target
             except Exception:
                 pass
+            return
+        error_type = self._probe_origin()
+        if error_type:
+            self.show_webview_error(error_type, target)
+            return
+        self._clear_error_page()
+        try:
+            self._window_load_url(target, window=window)
+            self.current_url = target
+        except Exception:
+            pass
+
+    def show_webview_error(self, error_type, target):
+        window = self.main_window
+        if window is None:
+            return
+        with self.error_lock:
+            self.error_retry_target = target
+            self.error_page_active = True
+            self.error_retry_stop.set()
+            self.error_retry_stop = threading.Event()
+            stop = self.error_retry_stop
+        try:
+            html = self._webview_error_html(error_type)
+            self._window_invoke(lambda win: win.load_html(html), window=window)
+            self.current_url = ""
+        except Exception:
+            pass
+
+        def retry_loop():
+            while not stop.is_set() and not self.reconnect_stop.is_set():
+                if stop.wait(10):
+                    return
+                if stop.is_set() or self.reconnect_stop.is_set():
+                    return
+                err = self._probe_origin()
+                if not err:
+                    self._recover_from_error(target)
+                    return
+
+        threading.Thread(target=retry_loop, daemon=True).start()
+
+    def _recover_from_error(self, target):
+        with self.error_lock:
+            if not self.error_page_active:
+                return
+            self.error_page_active = False
+            self.error_retry_stop.set()
+        try:
+            self._window_load_url(target, window=self.main_window)
+            self.current_url = target
+        except Exception:
+            pass
+
+    def retry_webview(self):
+        target = self.error_retry_target or self.safe_main_url()
+        err = self._probe_origin()
+        if not err:
+            self._recover_from_error(target)
+        else:
+            self.show_webview_error(err, target)
 
     def hide_main_window(self):
+        self._clear_error_page()
         if self.main_window is not None:
             try:
-                self.main_window.hide()
+                self._window_hide(window=self.main_window)
             except Exception:
                 pass
             try:
-                self.main_window.load_url("about:blank")
+                self._window_load_url("about:blank", window=self.main_window)
                 self.current_url = "about:blank"
             except Exception:
                 pass
 
     def quit(self):
         self.reconnect_stop.set()
+        self.tray_refresh_stop.set()
         if self.ws is not None:
             try:
                 self.ws.close()
@@ -2129,7 +3305,7 @@ class ClientApp:
         self.audio.stop()
         if self.main_window is not None:
             try:
-                self.main_window.destroy()
+                self._window_destroy(window=self.main_window)
             except Exception:
                 pass
             self.main_window = None
@@ -2142,32 +3318,39 @@ class ClientApp:
         os._exit(0)
 
     def disconnect_from_server(self):
+        self.notify_server_logout()
         self.reconnect_stop.set()
         if self.ws is not None:
             self.ws.close()
             self.ws = None
         self.audio.stop()
+        self.clear_webview_storage()
         self.token = ""
         self.refresh_token = ""
         self.role = ""
         self.user_id = None
         self.origin = ""
         self.guest_available = False
-        for key in ("server", "server_input", "token", "token_enc", "refresh_token", "refresh_token_enc", "role", "user_id", "product_name", "guest_available"):
+        for key in ("server", "server_input", "token", "token_enc", "refresh_token", "refresh_token_enc", "role", "user_id", "product_name", "guest_available", "sso_provider", "desktop_sso_start_path", "desktop_sso_poll_path"):
             self.config.pop(key, None)
         save_config(self.config)
         self.product_name = APP_FALLBACK_NAME
         self.connected = False
         self.auth_notified = False
         self.current_url = ""
+        self.tray_refresh_stop.clear()
         self.refresh_tray()
         self.hide_main_window()
         self.reconnect_stop = threading.Event()
         self.ws_thread = None
 
     def show_server_dialog(self):
-        with self.tk_lock:
-            result = ServerAddressDialog(self).run()
+        if not self.tk_lock.acquire(blocking=False):
+            return
+        try:
+            result = run_on_tk_thread(lambda: ServerAddressDialog(self).run())
+        finally:
+            self.tk_lock.release()
         if not result:
             if not self.origin:
                 self.quit()
@@ -2178,30 +3361,41 @@ class ClientApp:
     def apply_server(self, raw_input_value, info, origin):
         self.origin = origin
         self.guest_available = bool(info.get("guest_receiver_enabled"))
+        self.sso_provider = str(info.get("sso_provider") or "")
+        self.desktop_sso_start_path = str(info.get("desktop_sso_start_path") or "/desktop/sso/start")
+        self.desktop_sso_poll_path = str(info.get("desktop_sso_poll_path") or "/desktop/sso/poll")
         self.set_product_name(info.get("product_name"))
         self.config.update({
             "server": origin,
             "server_input": raw_input_value,
             "guest_available": self.guest_available,
+            "sso_provider": self.sso_provider,
+            "desktop_sso_start_path": self.desktop_sso_start_path,
+            "desktop_sso_poll_path": self.desktop_sso_poll_path,
         })
         save_config(self.config)
+        self.pending_welcome = True
         if self.guest_available and not self.token:
             try:
-                session, _url = http_json(origin, "/desktop/session/guest", method="POST")
+                session, _url = http_json(origin, "/desktop/session/guest", method="POST", timeout=3)
                 self.apply_session(session)
             except Exception:
                 pass
         self.start_reconnect_loop()
-        self.show_main_window("/" if self.guest_available else "/login")
+        self.show_main_window("/")
 
     def apply_session(self, session):
-        self.token = str(session.get("token") or "")
-        self.refresh_token = str(session.get("refresh_token") or self.refresh_token or "")
-        user = session.get("user") or {}
+        old_identity = desktop_token_identity(self.token)
+        new_token = str((session or {}).get("token") or "")
+        new_identity = desktop_token_identity(new_token)
+        same_live_identity = bool(old_identity[0] and new_identity[0] and old_identity == new_identity)
+        self.token = new_token
+        self.refresh_token = str((session or {}).get("refresh_token") or self.refresh_token or "")
+        user = (session or {}).get("user") or {}
         self.role = str(user.get("role") or "")
         self.user_id = user.get("id")
         self.persist_session_state()
-        if self.ws is not None:
+        if self.ws is not None and not same_live_identity:
             self.ws.close()
             self.ws = None
         self.refresh_tray()
@@ -2209,29 +3403,66 @@ class ClientApp:
             self.sync_web_session_in_webview()
 
     def sync_web_session_in_webview(self):
-        token = str(self.token or "").strip()
-        window = self.main_window
-        if str(self.role or "").strip().lower() == "guest" or str(self.user_id or "").strip().lower() == "guest":
+        if not self.web_session_sync_lock.acquire(blocking=False):
             return
-        if not token or window is None or not self.origin:
-            return
-        current = str(self.current_url or "")
-        if current and (not current.startswith(self.origin) or current == "about:blank"):
-            return
-        script = (
-            "(function(){"
-            "var t=" + json.dumps(token) + ";"
-            "if(!t)return false;"
-            "return fetch('/desktop/session/web-login?desktop_client=1',{method:'POST',headers:{'"
-            + DESKTOP_CLIENT_HEADER + "':'1','Authorization':'Bearer '+t}})"
-            ".then(function(r){return !!r.ok;})"
-            ".catch(function(){return false;});"
-            "})()"
-        )
-        try:
-            window.evaluate_js(script)
-        except Exception:
-            pass
+
+        def worker():
+            try:
+                if str(self.role or "").strip().lower() == "guest" or str(self.user_id or "").strip().lower() == "guest":
+                    return
+                window = self.main_window
+                if window is None or not self.origin:
+                    return
+                current = self._window_get_current_url(window=window)
+                if current:
+                    self.current_url = current
+                if current == "about:blank":
+                    return
+                if current and not self.is_server_url(current):
+                    return
+                current_path = ""
+                try:
+                    current_path = str(urllib.parse.urlparse(current).path or "").rstrip("/")
+                except Exception:
+                    current_path = ""
+                if current_path == "/login" or current_path.startswith("/login/"):
+                    try:
+                        self.refresh_desktop_session(timeout=4)
+                    except Exception:
+                        pass
+                token = str(self.token or "").strip()
+                if not token:
+                    return
+                script = (
+                    "(function(){"
+                    "var t=" + json.dumps(token) + ";"
+                    "if(!t)return false;"
+                    "try{"
+                    "fetch('/desktop/session/web-login?desktop_client=1',{method:'POST',credentials:'include',headers:{'"
+                    + DESKTOP_CLIENT_HEADER + "':'1','Authorization':'Bearer '+t}})"
+                    ".then(function(r){return !!(r&&r.ok);})"
+                    ".then(function(ok){"
+                    "if(!ok)return;"
+                    "try{"
+                    "var path=(window.location&&window.location.pathname?window.location.pathname:'');"
+                    "if(path.indexOf('/login')!==-1){"
+                    "window.location.href='/?desktop_client=1';"
+                    "}"
+                    "}catch(_e){}"
+                    "})"
+                    ".catch(function(){});"
+                    "}catch(_e){return false;}"
+                    "return true;"
+                    "})()"
+                )
+                try:
+                    self._window_eval_js(script, window=window)
+                except Exception:
+                    pass
+            finally:
+                self.web_session_sync_lock.release()
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def persist_session_state(self):
         self.config.update({"role": self.role, "user_id": self.user_id})
@@ -2239,7 +3470,7 @@ class ClientApp:
         write_secure_config_value(self.config, "refresh_token", self.refresh_token)
         save_config(self.config)
 
-    def refresh_desktop_session(self):
+    def refresh_desktop_session(self, timeout=10):
         if not self.origin or not self.refresh_token:
             return False
         try:
@@ -2248,7 +3479,16 @@ class ClientApp:
                 "/desktop/session/refresh",
                 method="POST",
                 body={"refresh_token": self.refresh_token},
+                timeout=timeout,
             )
+        except urllib.error.HTTPError as exc:
+            if exc.code in (400, 401, 403, 404):
+                self.token = ""
+                self.refresh_token = ""
+                self.role = ""
+                self.user_id = None
+                self.persist_session_state()
+            return False
         except Exception:
             return False
         token = str((session or {}).get("token") or "")
@@ -2258,10 +3498,150 @@ class ClientApp:
         return True
 
     def open_app_settings(self):
-        if self.config.get("require_uac") and not uac_approved():
+        def run():
+            if not self.tk_lock.acquire(blocking=False):
+                return
+            try:
+                action = run_on_tk_thread(lambda: AppSettingsWindow(self).run())
+            finally:
+                self.tk_lock.release()
+            if action == "disconnect":
+                self.disconnect_from_server()
+                self.show_server_dialog()
+        threading.Thread(target=run, daemon=True).start()
+
+    def notify_server_logout(self):
+        origin = str(self.origin or "").strip()
+        token = str(self.token or "").strip()
+        refresh_token = str(self.refresh_token or "").strip()
+        if not origin or (not token and not refresh_token):
             return
-        with self.tk_lock:
-            AppSettingsWindow(self).run()
+        try:
+            http_json(
+                origin,
+                "/desktop/session/logout",
+                method="POST",
+                token=token,
+                body={"refresh_token": refresh_token},
+                timeout=8,
+            )
+        except Exception:
+            pass
+
+    def browser_logout_script(self):
+        token = json.dumps(str(self.token or ""))
+        refresh_token = json.dumps(str(self.refresh_token or ""))
+        header = json.dumps(DESKTOP_CLIENT_HEADER)
+        return (
+            "(async function(){"
+            "try{await fetch('/desktop/session/logout?desktop_client=1',{method:'POST',credentials:'include',headers:{"
+            + header + ":'1','Content-Type':'application/json','Authorization':'Bearer '+" + token + "},body:JSON.stringify({refresh_token:" + refresh_token + "})});}catch(_e){}"
+            "try{localStorage.clear();}catch(_e){}"
+            "try{sessionStorage.clear();}catch(_e){}"
+            "try{document.cookie.split(';').forEach(function(c){var n=c.split('=')[0].trim();if(n){document.cookie=n+'=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';document.cookie=n+'=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/; SameSite=Lax';}});}catch(_e){}"
+            "try{if(window.caches&&caches.keys){var ks=await caches.keys();await Promise.all(ks.map(function(k){return caches.delete(k);}));}}catch(_e){}"
+            "try{if(navigator.serviceWorker&&navigator.serviceWorker.getRegistrations){var rs=await navigator.serviceWorker.getRegistrations();await Promise.all(rs.map(function(r){return r.unregister();}));}}catch(_e){}"
+            "return true;})()"
+        )
+
+    def clear_native_webview_cookies(self):
+        window = self.main_window
+        if window is None:
+            return
+        native = getattr(window, "native", None)
+        candidates = []
+        if native is not None:
+            candidates.extend([native])
+            for name in ("CoreWebView2", "core_webview", "webview", "WebView", "Browser"):
+                try:
+                    value = getattr(native, name)
+                    if value is not None:
+                        candidates.append(value)
+                except Exception:
+                    pass
+        for candidate in candidates:
+            for name in ("CookieManager", "cookie_manager"):
+                try:
+                    manager = getattr(candidate, name)
+                except Exception:
+                    manager = None
+                if manager is None:
+                    continue
+                for method in ("DeleteAllCookies", "delete_all_cookies", "ClearCookies", "clear_cookies"):
+                    try:
+                        getattr(manager, method)()
+                    except Exception:
+                        pass
+
+    def delete_webview_storage(self):
+        storage = CONFIG_DIR / "webview"
+        deleted = False
+        for _attempt in range(6):
+            try:
+                if storage.exists():
+                    shutil.rmtree(storage)
+                deleted = True
+                break
+            except Exception:
+                time.sleep(0.2)
+        if deleted:
+            self.config.pop("clear_webview_storage", None)
+            save_config(self.config)
+        return deleted
+
+    def clear_webview_storage(self):
+        self.config["clear_webview_storage"] = True
+        save_config(self.config)
+        window = self.main_window
+        if window is not None:
+            try:
+                self._window_eval_js("window._opsTokenValue=null;window._opsTokenValueAt=0;window._opsTokenBusy=false;", window=window)
+            except Exception:
+                pass
+            try:
+                self._window_eval_js(self.browser_logout_script(), window=window)
+                time.sleep(0.25)
+            except Exception:
+                pass
+            try:
+                self._window_load_url("about:blank", window=window)
+                self.current_url = "about:blank"
+            except Exception:
+                pass
+        self.clear_native_webview_cookies()
+        self.delete_webview_storage()
+
+    def logout(self, rebuild_guest=True):
+        self.notify_server_logout()
+        self.reconnect_stop.set()
+        if self.ws is not None:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
+        self.audio.stop()
+        self.clear_webview_storage()
+        self.token = ""
+        self.refresh_token = ""
+        self.role = ""
+        self.user_id = None
+        self.persist_session_state()
+        self.connected = False
+        self.auth_notified = False
+        self.reconnect_stop = threading.Event()
+        self.ws_thread = None
+        self.refresh_tray()
+        if rebuild_guest and self.guest_available and self.origin:
+            try:
+                session, _url = http_json(self.origin, "/desktop/session/guest", method="POST")
+                self.apply_session(session)
+                self.start_reconnect_loop()
+                self.show_main_window("/")
+                return
+            except Exception:
+                pass
+        self.show_main_window("/")
 
     def start_reconnect_loop(self):
         if self.ws_thread is not None and self.ws_thread.is_alive():
@@ -2310,11 +3690,9 @@ class ClientApp:
                 self.handle_auth_failure()
                 time.sleep(5)
                 continue
-            except Exception as exc:
+            except Exception:
                 self.set_status(False)
-                if not self.startup_check_done:
-                    self.startup_check_done = True
-                    self.notify(self.product_name, f"Could not connect to the paging server: {exc}")
+                self.startup_check_done = True
                 time.sleep(min(delay, 30))
                 delay = min(delay * 2, 30)
                 continue
@@ -2347,12 +3725,19 @@ class ClientApp:
     def poll_web_session(self):
         script = (
             "(function(){"
+            "var now=Date.now();"
             "if(window._opsTokenBusy)return window._opsTokenValue||null;"
+            "if(window._opsTokenValue&&window._opsTokenValueAt&&now-window._opsTokenValueAt<60000)return window._opsTokenValue;"
             "window._opsTokenBusy=true;"
             "fetch('/desktop/session/token?desktop_client=1',{method:'POST',headers:{'" + DESKTOP_CLIENT_HEADER + "':'1','"
             + CLIENT_OS_HEADER + "':'" + client_os_string() + "'}})"
-            ".then(function(r){return r.ok?r.json():null})"
-            ".then(function(d){window._opsTokenValue=d?JSON.stringify(d):null;window._opsTokenBusy=false;})"
+            ".then(function(r){return r.ok?r.json():null;})"
+            ".then(function(d){"
+            "var hasToken=!!(d&&d.token);"
+            "window._opsTokenValue=hasToken?JSON.stringify(d):null;"
+            "window._opsTokenValueAt=hasToken?Date.now():0;"
+            "window._opsTokenBusy=false;"
+            "})"
             ".catch(function(){window._opsTokenBusy=false;});"
             "return window._opsTokenValue||null;})()"
         )
@@ -2361,57 +3746,62 @@ class ClientApp:
             window = self.main_window
             if window is None or not self.origin:
                 continue
-            cur = self.current_url
-            if not cur or cur == "about:blank" or not cur.startswith(self.origin):
+            try:
+                cur = self._window_get_current_url(window=window)
+                if cur:
+                    self.current_url = cur
+            except Exception:
+                cur = self.current_url
+            if not cur or cur == "about:blank" or not self.is_server_url(cur):
                 continue
             try:
-                raw = window.evaluate_js(script)
+                raw = self._window_eval_js(script, window=window)
             except Exception:
                 continue
             if not raw:
+                if self.token and self.current_url and ("/login" in self.current_url):
+                    self.sync_web_session_in_webview()
                 continue
             try:
                 session = json.loads(raw)
             except Exception:
                 continue
+            current_path = ""
+            try:
+                current_path = str(urllib.parse.urlparse(self.current_url).path or "").rstrip("/")
+            except Exception:
+                current_path = ""
+
             token = str(session.get("token") or "")
-            user = session.get("user") or {}
-            refresh_token = str(session.get("refresh_token") or "")
-            incoming_user_id = user.get("id")
-            incoming_role = str(user.get("role") or "")
-            current_user_id = str(self.user_id if self.user_id is not None else "")
-            next_user_id = str(incoming_user_id if incoming_user_id is not None else "")
-            current_role = str(self.role or "")
-            same_signed_in_user = bool(
-                self.token
-                and current_user_id
-                and next_user_id
-                and current_user_id == next_user_id
-                and current_role.strip().lower() == incoming_role.strip().lower()
-                and current_role.strip().lower() != "guest"
-            )
-            should_apply = bool(
-                token
-                and not same_signed_in_user
-                and (
-                    not self.token
-                    or current_role.strip().lower() == "guest"
-                    or current_user_id != next_user_id
-                    or current_role.strip().lower() != incoming_role.strip().lower()
-                )
-            )
-            if should_apply:
+            if token and token != self.token:
+                old_identity = desktop_token_identity(self.token)
+                new_identity = desktop_token_identity(token)
+                changed_identity = not (old_identity[0] and new_identity[0] and old_identity == new_identity)
                 self.apply_session(session)
-                self.start_reconnect_loop()
-                try:
-                    window.evaluate_js("window._opsTokenValue=null;")
-                except Exception:
-                    pass
-            elif same_signed_in_user and (token != self.token or (refresh_token and refresh_token != self.refresh_token)):
-                try:
-                    window.evaluate_js("window._opsTokenValue=null;")
-                except Exception:
-                    pass
+                if current_path == "/login" or current_path.startswith("/login/"):
+                    self.return_to_safe_main_url()
+                if changed_identity:
+                    self.pending_welcome = True
+                    self.start_reconnect_loop()
+                    try:
+                        self._window_eval_js("window._opsTokenValue=null;window._opsTokenValueAt=0;", window=window)
+                    except Exception:
+                        pass
+            elif token and (current_path == "/login" or current_path.startswith("/login/")):
+                self.return_to_safe_main_url()
+            elif not token and self.token and self.current_url and "/login" in self.current_url:
+                self.token = ""
+                self.refresh_token = ""
+                self.role = ""
+                self.user_id = None
+                self.persist_session_state()
+                self.refresh_tray()
+                if self.ws:
+                    try:
+                        self.ws.close()
+                    except Exception:
+                        pass
+                    self.ws = None
 
     def download_icon(self, broadcast_id, icon_name=""):
         if not broadcast_id:
@@ -2424,6 +3814,11 @@ class ClientApp:
 
     def handle_broadcast(self, message):
         broadcast_id = str(message.get("broadcast_id") or "")
+        priority = str(message.get("priority") or "Normal").strip().lower()
+        if priority == "emergency":
+            state = self.audio.live_state()
+            if str(state.get("broadcast_id") or "") != broadcast_id:
+                self.audio.stop()
         if broadcast_id:
             self.audio.register_broadcast(
                 broadcast_id,
@@ -2451,7 +3846,6 @@ class ClientApp:
         self.flash_receiving()
         shortmessage = str(message.get("shortmessage") or "").strip()
         longmessage = str(message.get("longmessage") or "").strip()
-        priority = str(message.get("priority") or "Normal").strip().lower()
         has_audio = bool(message.get("has_audio"))
         has_text = bool(shortmessage or longmessage)
         if not has_text:
@@ -2539,23 +3933,34 @@ class ClientApp:
         )
         popup_windows = []
         monitor_bounds = list(all_monitor_bounds())
-        for bounds in monitor_bounds:
-            win = webview.create_window(
-                self.product_name,
-                html=html,
-                js_api=self.build_api(),
-                x=int(bounds["x"]),
-                y=int(bounds["y"]),
-                width=max(1, int(bounds["width"])),
-                height=max(1, int(bounds["height"])),
-                on_top=True,
-                fullscreen=True,
-                resizable=False,
-                frameless=True,
-                easy_drag=False,
-            )
-            self.apply_native_icon(win)
-            popup_windows.append(win)
+
+        def create_popups(_win):
+            created = []
+            for bounds in monitor_bounds:
+                popup = webview.create_window(
+                    self.product_name,
+                    html=html,
+                    js_api=self.build_api(),
+                    x=int(bounds["x"]),
+                    y=int(bounds["y"]),
+                    width=max(1, int(bounds["width"])),
+                    height=max(1, int(bounds["height"])),
+                    on_top=True,
+                    fullscreen=True,
+                    resizable=False,
+                    frameless=True,
+                    easy_drag=False,
+                )
+                self.apply_native_icon(popup)
+                created.append(popup)
+            return created
+
+        try:
+            popup_windows = list(self._window_invoke(create_popups) or [])
+        except Exception:
+            popup_windows = []
+        if not popup_windows:
+            return
         self.popups[popup_id] = popup_windows
         self._force_popup_focus(popup_windows, monitor_bounds)
 
@@ -2589,7 +3994,7 @@ class ClientApp:
         self.popups.pop(popup_id, None)
         for window in windows:
             try:
-                window.destroy()
+                self._window_destroy(window=window)
             except Exception:
                 pass
 
@@ -2605,11 +4010,11 @@ class ClientApp:
     def restore_session_after_restart(self):
         if not self.origin or self.token:
             return
-        if self.refresh_desktop_session():
+        if self.refresh_desktop_session(timeout=3):
             return
         if self.guest_available:
             try:
-                session, _url = http_json(self.origin, "/desktop/session/guest", method="POST")
+                session, _url = http_json(self.origin, "/desktop/session/guest", method="POST", timeout=3)
                 self.apply_session(session)
                 return
             except Exception:
@@ -2617,64 +4022,186 @@ class ClientApp:
         window = self.main_window
         if window is None:
             return
-        try:
-            target = self.origin.rstrip("/") + self._desktop_page_path("/")
-            window.load_url(target)
-            self.current_url = target
-        except Exception:
-            pass
+        target = self.origin.rstrip("/") + self._desktop_page_path("/")
+        self.load_server_url(target, window=window)
 
     def on_main_window_closing(self):
         self.hide_main_window()
         return False
 
+    def on_main_window_before_load(self, *args):
+        if self.error_page_active:
+            return True
+        window = self.main_window
+        url = ""
+        for arg in args:
+            if isinstance(arg, str):
+                url = arg
+            elif hasattr(arg, "get_current_url"):
+                window = arg
+        if not url and window is not None:
+            # Never call window.get_current_url() here: before_load handlers
+            # run inline on the UI thread and get_current_url() blocks waiting
+            # for the "loaded" event that cannot fire until this handler
+            # returns, freezing the app ("Not Responding") for ~20 seconds.
+            url = self._window_get_current_url(window=window)
+        if url and self.is_server_url(url):
+            try:
+                parsed_url = urllib.parse.urlparse(url)
+                if parsed_url.path.rstrip("/") == "/desktop/app-settings":
+                    self.open_app_settings()
+                    self.return_to_safe_main_url()
+                    return False
+            except Exception:
+                pass
+        if url and self.is_server_url(url) and self.is_sso_url(url):
+            self.start_desktop_sso_flow()
+            self.return_to_safe_main_url()
+            return False
+        if url and not self.is_allowed_webview_url(url):
+            self.open_in_default_browser(url)
+            self.return_to_safe_main_url()
+            return False
+        return True
+
     def on_main_window_loaded(self):
+        if self.error_page_active:
+            return
         window = self.main_window
         if window is None:
             return
+        if not getattr(self, "_dpi_hook_installed", False):
+            try:
+                _hook_dpi_changed(self.main_window_hwnd())
+            except Exception:
+                pass
+            self._dpi_hook_installed = True
         try:
-            current = window.get_current_url() or ""
+            current = self._window_get_current_url(window=window)
         except Exception:
             current = ""
         self.current_url = current
-        if self.origin and current.startswith(self.origin):
+        if current and not self.is_allowed_webview_url(current):
+            self.open_in_default_browser(current)
+            self.return_to_safe_main_url()
+            return
+        if self.origin and self.is_server_url(current):
             try:
-                window.evaluate_js(INJECT_JS)
+                self._window_eval_js(INJECT_JS, window=window)
             except Exception:
                 pass
             self.sync_web_session_in_webview()
 
+    def start_show_event_listener(self):
+        # Waits for a second launch of the app (manual double-click or shortcut)
+        # to signal us, then restores/unminimizes the window from the tray.
+        if not sys.platform.startswith("win"):
+            return
+        handle = self._show_event_handle
+        if not handle:
+            handle = create_show_event()
+            self._show_event_handle = handle
+        if not handle:
+            return
+
+        def worker():
+            try:
+                kernel32 = ctypes.windll.kernel32
+                kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+                kernel32.WaitForSingleObject.restype = wintypes.DWORD
+                while not self.reconnect_stop.is_set():
+                    result = kernel32.WaitForSingleObject(handle, 500)
+                    if result == 0:  # WAIT_OBJECT_0 - another instance asked us to show
+                        threading.Thread(target=self.show_main_window, daemon=True).start()
+                    elif result not in (258,):  # anything other than WAIT_TIMEOUT means trouble
+                        break
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def bootstrap(self):
+        self.gui_thread_id = threading.get_ident()
         self.start_tray()
         self.apply_native_icon(self.main_window)
+        self.start_show_event_listener()
         threading.Thread(target=self.poll_web_session, daemon=True).start()
-        self.restore_session_after_restart()
         pending = getattr(self, "_pending_server", None)
         if pending:
             del self._pending_server
-            self.apply_server(*pending)
+            threading.Thread(target=self.apply_server, args=pending, daemon=True).start()
             return
-        if self.origin and self.token:
+        if self.origin:
             self.start_reconnect_loop()
             self.refresh_tray()
-        elif self.origin:
-            self.start_reconnect_loop()
-            if self.guest_available:
+            threading.Thread(target=self.restore_session_after_restart, daemon=True).start()
+            if not self.start_minimized:
                 self.show_main_window("/")
-            else:
-                self.show_main_window("/login")
+
+
+def _enable_high_dpi_awareness():
+    """Make the app Per-Monitor-V2 DPI-aware so the WebView2 UI renders crisply at
+    Windows display scaling above 100% (e.g. 125%/150%) instead of being
+    bitmap-stretched/blurry.
+
+    The bundled Python launches DPI-unaware, so without this the whole window is
+    scaled up by the OS as a blurry bitmap. System awareness renders blurry on any
+    monitor whose scale differs from the one that was primary at login, so we use
+    Per-Monitor V2, which lets WebView2 re-rasterize at the real current monitor
+    scale. The trade-off is that top-level windows now receive WM_DPICHANGED when
+    dragged between monitors of different scaling; the main window handles that via
+    _hook_dpi_changed so it keeps a consistent physical size instead of shrinking."""
+    if platform.system() != "Windows":
+        return
+    try:
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4 (Windows 10 1703+).
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
+    except (AttributeError, OSError):
+        pass
+    try:
+        # PROCESS_PER_MONITOR_DPI_AWARE = 2 (Windows 8.1+).
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except (AttributeError, OSError):
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except (AttributeError, OSError):
+        pass
 
 
 def main():
+    _enable_high_dpi_awareness()
+    autostart = launched_at_startup()
+    is_primary, mutex_handle = _acquire_single_instance()
+    if not is_primary:
+        # Another instance is already running: ask it to surface its window
+        # (item 4 - clicking the exe while running unminimizes from the tray).
+        signal_existing_instance()
+        return
+    _SINGLE_INSTANCE_HANDLES.append(mutex_handle)
+    show_event_handle = create_show_event()
+    _SINGLE_INSTANCE_HANDLES.append(show_event_handle)
+    try:
+        webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
+        webview.settings["ALLOW_FILE_URLS"] = False
+    except Exception:
+        pass
     app = ClientApp()
-    # Show server address dialog on the main thread BEFORE webview takes it over.
-    # (tkinter must run on the main thread; webview.start() permanently captures it.)
+    app.launched_at_startup = autostart
+    app._show_event_handle = show_event_handle
+    # Start minimized (to tray) only when launched at startup AND already logged in
+    # and configured to connect to a server. Otherwise start "loudly" (visible),
+    # and manual launches always show the window.
+    app.start_minimized = bool(autostart and app.origin and app.token)
     if not app.origin:
-        result = ServerAddressDialog(app).run()
+        result = run_on_tk_thread(lambda: ServerAddressDialog(app).run())
         if result:
             raw_input_value, info, origin = result
             app._pending_server = (raw_input_value, info, origin)
         else:
+            app.quit()
             return
     window = webview.create_window(
         app.product_name,
@@ -2687,6 +4214,10 @@ def main():
     )
     app.main_window = window
     window.events.closing += app.on_main_window_closing
+    try:
+        window.events.before_load += app.on_main_window_before_load
+    except Exception:
+        pass
     window.events.loaded += app.on_main_window_loaded
     storage = CONFIG_DIR / "webview"
     try:
@@ -2696,8 +4227,12 @@ def main():
     try:
         webview.start(app.bootstrap, private_mode=False, storage_path=str(storage), gui="edgechromium")
     except Exception:
-        webview.start(app.bootstrap, private_mode=False, storage_path=str(storage))
-    app.quit()
+        try:
+            webview.start(app.bootstrap, private_mode=False, storage_path=str(storage))
+        except Exception:
+            pass
+    finally:
+        app.quit()
 
 
 if __name__ == "__main__":
